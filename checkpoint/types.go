@@ -80,10 +80,10 @@ type ShardFailure struct {
 type ShardFailureReason int
 
 const (
-	ShardMissing    ShardFailureReason = iota // 分片文件缺失
-	ShardTruncated                            // 分片大小与清单不符（截断或超长）
-	ShardCorrupted                            // 校验和不匹配
-	ShardOrphan                               // 磁盘上存在但清单未声明
+	ShardMissing   ShardFailureReason = iota // 分片文件缺失
+	ShardTruncated                           // 分片大小与清单不符（截断或超长）
+	ShardCorrupted                           // 校验和不匹配
+	ShardOrphan                              // 磁盘上存在但清单未声明
 )
 
 func (r ShardFailureReason) String() string {

@@ -123,9 +123,9 @@ func TestAbortLeavesNoResidue(t *testing.T) {
 
 func TestShardFailuresAreDistinguishable(t *testing.T) {
 	cases := []struct {
-		name   string
+		name    string
 		corrupt func(dir string)
-		want   ShardFailureReason
+		want    ShardFailureReason
 	}{
 		{"missing", func(dir string) {
 			os.Remove(filepath.Join(dir, shardsDir, "000001.bin"))
