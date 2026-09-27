@@ -25,7 +25,7 @@ func TestConcurrentCommits(t *testing.T) {
 			w, err := s.Begin(context.Background(), v)
 			if err == nil {
 				for sh := 0; sh < 3; sh++ {
-					err = w.WriteShard(sh, []byte(fmt.Sprintf("v%d-s%d", v, sh)))
+					err = w.WriteShard(context.Background(), sh, []byte(fmt.Sprintf("v%d-s%d", v, sh)))
 					if err != nil {
 						break
 					}
@@ -41,6 +41,8 @@ func TestConcurrentCommits(t *testing.T) {
 		}
 	}
 	// 第二阶段：全部 Commit 并发进行。
+	// 版本准入规则：高版本提交成功后，低版本不得再落盘（ErrVersionRegression），
+	// 因此并发提交的结果集必须满足“成功版本在提交时序上严格递增”。
 	errs := make([]error, n)
 	for i := 0; i < n; i++ {
 		wg.Add(1)
@@ -50,17 +52,36 @@ func TestConcurrentCommits(t *testing.T) {
 		}(uint64(i + 1))
 	}
 	wg.Wait()
+	var maxCommitted uint64
 	for i, err := range errs {
+		v := uint64(i + 1)
 		if err != nil {
-			t.Fatalf("commit v%d: %v", i+1, err)
+			if !errors.Is(err, ErrVersionRegression) {
+				t.Fatalf("commit v%d: unexpected err=%v", v, err)
+			}
+			// 被拒绝的版本不得留下可恢复的内容。
+			if _, _, rerr := s.Recover(v); rerr == nil {
+				t.Fatalf("rejected v%d must not be recoverable", v)
+			}
+			continue
+		}
+		if v > maxCommitted {
+			maxCommitted = v
 		}
 	}
-	latest, err := s.Latest()
-	if err != nil || latest != n {
-		t.Fatalf("latest=%d err=%v, want %d", latest, err, n)
+	// 最高版本没有任何更高版本竞争，必须提交成功。
+	if errs[n-1] != nil {
+		t.Fatalf("commit highest v%d must succeed: %v", n, errs[n-1])
 	}
-	// 每个已提交版本都必须完整可恢复，无半写入可见。
+	latest, err := s.Latest()
+	if err != nil || latest != maxCommitted {
+		t.Fatalf("latest=%d err=%v, want %d", latest, err, maxCommitted)
+	}
+	// 每个提交成功的版本都必须完整可恢复，无半写入可见。
 	for v := uint64(1); v <= n; v++ {
+		if errs[v-1] != nil {
+			continue
+		}
 		data, rep, err := s.Recover(v)
 		if err != nil || !rep.OK() {
 			t.Fatalf("recover v%d: err=%v rep=%+v", v, err, rep)
@@ -72,7 +93,7 @@ func TestConcurrentCommits(t *testing.T) {
 			}
 		}
 	}
-	t.Logf("判定依据: %d 个并发提交全部成功, latest=%d, 逐版本逐分片内容核对一致", n, latest)
+	t.Logf("判定依据: %d 个并发提交中成功集在提交时序上严格递增, latest=%d, 成功版本逐分片核对一致, 被拒绝版本不可恢复", n, latest)
 }
 
 // 并发恢复与提交交错：读取者不得看到中间态。
@@ -104,7 +125,7 @@ func TestConcurrentRecoverDuringCommit(t *testing.T) {
 		}()
 	}
 	w, _ := s.Begin(context.Background(), 2)
-	_ = w.WriteShard(0, []byte("v2"))
+	_ = w.WriteShard(context.Background(), 0, []byte("v2"))
 	_ = w.Commit()
 	close(stop)
 	wg.Wait()

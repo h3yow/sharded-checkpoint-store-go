@@ -24,12 +24,24 @@ var (
 	ErrResourceLimit = errors.New("checkpoint: resource limit exceeded")
 	// ErrNoCheckpoint 表示存储中没有任何已提交检查点。
 	ErrNoCheckpoint = errors.New("checkpoint: no committed checkpoint")
+	// ErrInvalidVersion 表示版本编号本身不合法（如 0，无法通过恢复入口寻址）。
+	ErrInvalidVersion = errors.New("checkpoint: invalid version")
 )
 
 // 格式版本兼容范围。
 const (
 	MinFormatVersion = 1
 	MaxFormatVersion = 2
+)
+
+// StagingPolicy 决定写入过程中暂存数据达到上限时的行为。
+type StagingPolicy int
+
+const (
+	// StagingReject 暂存超限立即拒绝，返回 ErrResourceLimit。
+	StagingReject StagingPolicy = iota
+	// StagingWait 暂存超限时阻塞等待空位，直到有容量或 ctx 取消。
+	StagingWait
 )
 
 // Config 为存储的可配置资源上限与行为策略。
@@ -40,6 +52,11 @@ type Config struct {
 	MaxShardBytes int64
 	// MaxInflight 允许并行进行的写入事务数，超限时阻塞。
 	MaxInflight int
+	// MaxStagedBytes 所有进行中的写入事务在内存中暂存的数据总量上限（字节）。
+	// <= 0 表示不限制。暂存数据在 Commit 落盘、Abort/失败时释放。
+	MaxStagedBytes int64
+	// Staging 暂存超限时的策略，零值为 StagingReject。
+	Staging StagingPolicy
 }
 
 func (c *Config) withDefaults() Config {
