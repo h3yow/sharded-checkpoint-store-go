@@ -25,7 +25,7 @@ func TestConcurrentCommits(t *testing.T) {
 			w, err := s.Begin(context.Background(), v)
 			if err == nil {
 				for sh := 0; sh < 3; sh++ {
-					err = w.WriteShard(sh, []byte(fmt.Sprintf("v%d-s%d", v, sh)))
+					err = w.WriteShard(t.Context(), sh, []byte(fmt.Sprintf("v%d-s%d", v, sh)))
 					if err != nil {
 						break
 					}
@@ -41,6 +41,9 @@ func TestConcurrentCommits(t *testing.T) {
 		}
 	}
 	// 第二阶段：全部 Commit 并发进行。
+	// 严格版本准入下，提交被串行化且只允许单调递增：
+	// 成功集合必为“提交时创新高”的版本子序列，最高版本 n 必定成功；
+	// 在高版本之后落盘的低版本必须被明确拒绝且不留可读残留。
 	errs := make([]error, n)
 	for i := 0; i < n; i++ {
 		wg.Add(1)
@@ -50,17 +53,40 @@ func TestConcurrentCommits(t *testing.T) {
 		}(uint64(i + 1))
 	}
 	wg.Wait()
-	for i, err := range errs {
-		if err != nil {
-			t.Fatalf("commit v%d: %v", i+1, err)
+	if errs[n-1] != nil {
+		t.Fatalf("commit highest v%d: %v (最高版本必须成功)", n, errs[n-1])
+	}
+	var okVersions []uint64
+	for v := uint64(1); v <= n; v++ {
+		err := errs[v-1]
+		if err == nil {
+			okVersions = append(okVersions, v)
+			continue
+		}
+		// 失败的只能是“低版本在高版本之后落盘”，必须报版本回退。
+		if !errors.Is(err, ErrVersionRegression) {
+			t.Fatalf("commit v%d err=%v, want ErrVersionRegression", v, err)
+		}
+		// 被拒绝的版本不得留下可读回的有效内容。
+		if _, _, rerr := s.Recover(v); rerr == nil {
+			t.Fatalf("rejected v%d must not be recoverable", v)
+		}
+		if _, statErr := os.Stat(s.chkDir(v)); !errors.Is(statErr, os.ErrNotExist) {
+			t.Fatalf("rejected v%d leaves residue dir", v)
+		}
+	}
+	// 成功集合必须严格递增（版本顺序与提交结果一致）。
+	for i := 1; i < len(okVersions); i++ {
+		if okVersions[i] <= okVersions[i-1] {
+			t.Fatalf("committed versions not increasing: %v", okVersions)
 		}
 	}
 	latest, err := s.Latest()
 	if err != nil || latest != n {
 		t.Fatalf("latest=%d err=%v, want %d", latest, err, n)
 	}
-	// 每个已提交版本都必须完整可恢复，无半写入可见。
-	for v := uint64(1); v <= n; v++ {
+	// 每个成功提交的版本都必须完整可恢复，无半写入可见。
+	for _, v := range okVersions {
 		data, rep, err := s.Recover(v)
 		if err != nil || !rep.OK() {
 			t.Fatalf("recover v%d: err=%v rep=%+v", v, err, rep)
@@ -72,7 +98,7 @@ func TestConcurrentCommits(t *testing.T) {
 			}
 		}
 	}
-	t.Logf("判定依据: %d 个并发提交全部成功, latest=%d, 逐版本逐分片内容核对一致", n, latest)
+	t.Logf("判定依据: 成功提交集合 %v 严格递增且 latest=%d, 被拒绝版本不可恢复且无残留", okVersions, latest)
 }
 
 // 并发恢复与提交交错：读取者不得看到中间态。
@@ -104,7 +130,7 @@ func TestConcurrentRecoverDuringCommit(t *testing.T) {
 		}()
 	}
 	w, _ := s.Begin(context.Background(), 2)
-	_ = w.WriteShard(0, []byte("v2"))
+	_ = w.WriteShard(t.Context(), 0, []byte("v2"))
 	_ = w.Commit()
 	close(stop)
 	wg.Wait()

@@ -24,7 +24,7 @@ func commitShards(t *testing.T, s *Store, version uint64, payloads ...[]byte) {
 		t.Fatalf("begin v%d: %v", version, err)
 	}
 	for i, p := range payloads {
-		if err := w.WriteShard(i, p); err != nil {
+		if err := w.WriteShard(t.Context(), i, p); err != nil {
 			t.Fatalf("write shard %d: %v", i, err)
 		}
 	}
@@ -43,7 +43,7 @@ func TestInterruptedWriteNotVisible(t *testing.T) {
 	if err != nil {
 		t.Fatalf("begin v2: %v", err)
 	}
-	if err := w.WriteShard(0, []byte("b0")); err != nil {
+	if err := w.WriteShard(t.Context(), 0, []byte("b0")); err != nil {
 		t.Fatalf("write shard: %v", err)
 	}
 	t.Logf("中断场景: version=2 写入 1/3 分片后中断, 输入 shard0=%q", "b0")
@@ -80,7 +80,7 @@ func TestAbortLeavesNoResidue(t *testing.T) {
 	if err != nil {
 		t.Fatalf("begin: %v", err)
 	}
-	_ = w.WriteShard(0, []byte("x"))
+	_ = w.WriteShard(t.Context(), 0, []byte("x"))
 	if err := w.Abort(); err != nil {
 		t.Fatalf("abort: %v", err)
 	}
@@ -172,10 +172,10 @@ func TestResourceLimits(t *testing.T) {
 	if err != nil {
 		t.Fatalf("begin: %v", err)
 	}
-	if err := w.WriteShard(2, []byte("ab")); !errors.Is(err, ErrResourceLimit) {
+	if err := w.WriteShard(t.Context(), 2, []byte("ab")); !errors.Is(err, ErrResourceLimit) {
 		t.Fatalf("shard index 2 err=%v, want ErrResourceLimit", err)
 	}
-	if err := w.WriteShard(0, []byte("12345")); !errors.Is(err, ErrResourceLimit) {
+	if err := w.WriteShard(t.Context(), 0, []byte("12345")); !errors.Is(err, ErrResourceLimit) {
 		t.Fatalf("oversize shard err=%v, want ErrResourceLimit", err)
 	}
 	t.Logf("判定依据: MaxShards=2, MaxShardBytes=4, 超限写入均被 ErrResourceLimit 拒绝")
@@ -196,7 +196,7 @@ func TestCommitValidation(t *testing.T) {
 		t.Fatalf("commit with no shards should fail")
 	}
 	w2, _ := s.Begin(t.Context(), 1)
-	_ = w2.WriteShard(1, []byte("gap")) // 跳过 index 0
+	_ = w2.WriteShard(t.Context(), 1, []byte("gap")) // 跳过 index 0
 	if err := w2.Commit(); err == nil {
 		t.Fatalf("commit with non-contiguous shards should fail")
 	}
