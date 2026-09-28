@@ -77,8 +77,21 @@
 暂存数据的总量（`<= 0` 表示不限）。`Config.Staging` 选择超限策略：
 
 - **`StagingReject`（默认）**：超限立即返回 `ErrResourceLimit`。
-- **`StagingWait`**：阻塞等待空位；其他事务 `Commit`/`Abort` 释放配额后被唤醒。
-  等待中 `ctx` 取消会尽快退出并返回 `ctx.Err()`。
+- **`StagingWait`**：容量不足时进入 FIFO 等待队列阻塞，直到有容量或 `ctx` 取消。
+  - **一次释放、批量唤醒**：等待策略为每个排队事务维护**独立的唤醒信号**。任一事务
+    `Commit`/`Abort` 释放配额时，会**从队首扫描整个等待队列，把当前空位放得下的
+    排队事务一次性全部放行**——一次释放可以同时唤醒多个等待者，信号不会丢失，
+    也不会只放行一个。因此不会出现“已经有空闲容量，却只有一个排队事务被放行、
+    其余必须再等下一次释放”的批量并发卡死。
+  - **不超发、不饿死**：扫描按 FIFO 顺序进行，只有 `已用量 + 申请量 <= 容量`
+    的等待者才会拿到配额，放不下的继续留在队列中，且**不会挡住它后面放得下的
+    等待者**（小申请可越过大申请先放行）；一旦后续释放让队首等待者放得下，它会
+    在最早一次扫描中被放行，不会因持续到达的新申请而长期拿不到已有空位。
+    新申请在队列非空时一律入队尾，不得插队抢占。
+  - **等待中取消**：无论同时有多少个等待者，任一等待者的 `ctx` 取消都会使其
+    **尽快退出等待并返回 `ctx.Err()`**，同时从等待队列摘除、不占任何配额；
+    取消不影响其他等待者被后续释放唤醒。唤醒与取消同时发生时，取消语义优先，
+    已拿到的配额会被立即归还并继续放行其他等待者，保证配额不泄漏。
 
 覆盖同序号分片按差额增减配额；单笔超过总容量的写入永远无法满足，两种策略都
 立即拒绝。无论拒绝还是取消，暂存数据尚未落盘，`Abort`/失败路径会清理目录并
@@ -108,8 +121,17 @@ go test -v ./...     # 查看关键输入与判定依据日志
 
 # 单独复现新增行为
 go test -v -run 'TestDerive' ./...        # 版本承接：与全量重写一致 / 来源失败无残留 / 老格式来源
-go test -v -run 'TestStaging' ./...       # 暂存超限：拒绝 / 等待取消 / 唤醒
+go test -v -run 'TestStaging' ./...       # 暂存超限：拒绝 / 等待取消 / 单次释放多等待者唤醒
 go test -v -run 'TestLowVersion|TestConcurrentOutOfOrder|TestVersionZero' ./...  # 版本准入竞争
+
+# 重点复现“一次释放唤醒多个等待者”（预算级 + Store 级，建议带竞态检测）
+go test -race -v -run 'TestStagingBudgetOneReleaseWakesMultipleWaiters|TestStoreMultipleWaitersReleasedTogether' ./...
+# 等待中取消（多个等待者并存时取消其中一部分，无残留、不泄漏配额）
+go test -race -v -run 'TestStagingBudgetWaitCancel|TestStoreMultipleWaitersCancelNoResidue' ./...
+# 放不下继续等待、越过大申请放行、随后不再饿死
+go test -race -v -run 'TestStagingBudgetWaiterThatDoesNotFitKeepsWaiting|TestStoreDoesNotFitKeepsWaitingStoreLevel' ./...
+# 大批量同批唤醒 + 取消交错的竞态压力（可加 -count=N 反复跑）
+go test -race -count=20 -run 'TestStagingWaitMassWakeupRace' ./...
 ```
 
 测试覆盖：中断写入（`TestInterruptedWriteNotVisible`）、中止清理
@@ -122,5 +144,19 @@ go test -v -run 'TestLowVersion|TestConcurrentOutOfOrder|TestVersionZero' ./... 
 `TestDeriveFromLegacyFormat`/`TestDeriveAbort`）、
 暂存容量（`TestStagingRejectPolicy`/`TestStagingWaitPolicyCancel`/
 `TestStagingWaitPolicyUnblocked`/`TestStagingExceedsTotalCapacity`）、
+暂存等待的批量唤醒与取消边界（`TestStagingBudgetOneReleaseWakesMultipleWaiters`/
+`TestStagingBudgetSingleWaiterWoken`/`TestStagingBudgetWaitCancel`/
+`TestStagingBudgetWaiterThatDoesNotFitKeepsWaiting`/
+`TestStoreMultipleWaitersReleasedTogether`/`TestStoreMultipleWaitersCancelNoResidue`/
+`TestStoreDoesNotFitKeepsWaitingStoreLevel`/`TestStagingWaitMassWakeupRace`）、
 版本准入竞争（`TestLowVersionCommitRejectedAfterHighCommits`/
 `TestConcurrentOutOfOrderCommits`/`TestVersionZeroRejected`）。
+
+### 暂存等待唤醒语义（缺陷背景）
+
+早期实现用一个容量为 1 的共享信号通道承载所有唤醒提示：一次 `release` 最多
+投递一个信号。当一次释放出的空间足够满足多个排队事务时，只有其中一个等待者
+被唤醒，其余等待者即便空位放得下也必须再等下一次释放；批量并发写入下这会
+表现为偶发的长时间卡死。现实现改为**每等待者独立信号 + 释放时全队列扫描
+一次性放行所有放得下者**，上述用例在旧实现上会稳定超时失败、在新实现上通过，
+可作为本地复现该缺陷的回归基线。
