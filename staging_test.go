@@ -150,6 +150,143 @@ func TestStagingWaitPolicyUnblocked(t *testing.T) {
 	t.Logf("判定依据: A 提交释放配额 -> B 等待被唤醒并完成提交")
 }
 
+// 暂存超限 - 等待策略：一次释放出的容量足够多个排队事务时，所有当前放得下的
+// 排队事务都应在同一次释放后继续推进（旧实现只放行一个，其余必须再等一次释放，
+// 批量并发写入时偶发长时间卡死）。
+func TestStagingWaitPolicyBroadcastMultiple(t *testing.T) {
+	s := mustOpen(t, &Config{
+		MaxStagedBytes: 8,
+		Staging:        StagingWait,
+		MaxShardBytes:  1 << 20,
+		MaxInflight:    4,
+	})
+	// A 占满全部 8 字节。
+	wa, err := s.Begin(t.Context(), 1)
+	if err != nil {
+		t.Fatalf("begin A: %v", err)
+	}
+	if err := wa.WriteShard(t.Context(), 0, []byte("12345678")); err != nil {
+		t.Fatalf("A write: %v", err)
+	}
+	// B、C 各需 4 字节，都放不下，先后进入等待。
+	wb, err := s.Begin(t.Context(), 2)
+	if err != nil {
+		t.Fatalf("begin B: %v", err)
+	}
+	wc, err := s.Begin(t.Context(), 3)
+	if err != nil {
+		t.Fatalf("begin C: %v", err)
+	}
+	errB := make(chan error, 1)
+	errC := make(chan error, 1)
+	go func() { errB <- wb.WriteShard(context.Background(), 0, []byte("bbbb")) }()
+	go func() { errC <- wc.WriteShard(context.Background(), 0, []byte("cccc")) }()
+	waitForBudgetWaiters(t, s.budget, 2)
+
+	// A 提交一次性释放全部 8 字节：B 和 C 都应被同一次释放放行。
+	if err := wa.Commit(); err != nil {
+		t.Fatalf("commit A: %v", err)
+	}
+	for name, ch := range map[string]<-chan error{"B": errB, "C": errC} {
+		select {
+		case err := <-ch:
+			if err != nil {
+				t.Fatalf("writer %s after broadcast: %v", name, err)
+			}
+		case <-time.After(2 * time.Second):
+			t.Fatalf("writer %s 未被同一次释放唤醒（多等待者广播缺失）", name)
+		}
+	}
+	t.Logf("判定依据: A 一次释放 8 字节 -> B、C 两个等待事务同时被放行，used=%d", s.budget.snapshotUsed())
+	if err := wb.Commit(); err != nil {
+		t.Fatalf("commit B: %v", err)
+	}
+	if err := wc.Commit(); err != nil {
+		t.Fatalf("commit C: %v", err)
+	}
+	for v, want := range map[uint64]string{2: "bbbb", 3: "cccc"} {
+		data, rep, err := s.Recover(v)
+		if err != nil || !rep.OK() || string(data[0]) != want {
+			t.Fatalf("recover v%d: data=%q err=%v", v, data[0], err)
+		}
+	}
+}
+
+// 暂存超限 - 等待策略：多个等待者并发取消时各自尽快退出，取消不依赖释放、
+// 不互相吞掉唤醒；取消中止后目录不得残留为可恢复版本，且容量完整归还，
+// 后来的事务可立即写满全部配额。
+func TestStagingWaitPolicyCancelMultipleWaiters(t *testing.T) {
+	s := mustOpen(t, &Config{
+		MaxStagedBytes: 8,
+		Staging:        StagingWait,
+		MaxShardBytes:  1 << 20,
+		MaxInflight:    4,
+	})
+	wa, err := s.Begin(t.Context(), 1)
+	if err != nil {
+		t.Fatalf("begin A: %v", err)
+	}
+	if err := wa.WriteShard(t.Context(), 0, []byte("12345678")); err != nil {
+		t.Fatalf("A write: %v", err)
+	}
+	wb, err := s.Begin(t.Context(), 2)
+	if err != nil {
+		t.Fatalf("begin B: %v", err)
+	}
+	wc, err := s.Begin(t.Context(), 3)
+	if err != nil {
+		t.Fatalf("begin C: %v", err)
+	}
+	ctxB, cancelB := context.WithCancel(context.Background())
+	ctxC, cancelC := context.WithCancel(context.Background())
+	errB := make(chan error, 1)
+	errC := make(chan error, 1)
+	go func() { errB <- wb.WriteShard(ctxB, 0, []byte("bb")) }()
+	go func() { errC <- wc.WriteShard(ctxC, 0, []byte("cc")) }()
+	waitForBudgetWaiters(t, s.budget, 2)
+
+	cancelB()
+	cancelC() // 两次取消都不伴随容量释放
+	for name, ch := range map[string]<-chan error{"B": errB, "C": errC} {
+		select {
+		case err := <-ch:
+			if !errors.Is(err, context.Canceled) {
+				t.Fatalf("writer %s cancel err=%v, want context.Canceled", name, err)
+			}
+		case <-time.After(2 * time.Second):
+			t.Fatalf("writer %s 取消后未及时退出", name)
+		}
+	}
+	if used := s.budget.snapshotUsed(); used != 8 {
+		t.Fatalf("used=%d after cancel, want 8（取消不得占/放容量）", used)
+	}
+	if waiters := s.budget.snapshotWaiters(); waiters != 0 {
+		t.Fatalf("waiting=%d, want 0", waiters)
+	}
+	for _, w := range []*Writer{wb, wc} {
+		if err := w.Abort(); err != nil {
+			t.Fatalf("abort: %v", err)
+		}
+	}
+	for _, v := range []uint64{2, 3} {
+		if _, _, err := s.Recover(v); !errors.Is(err, ErrNoCheckpoint) {
+			t.Fatalf("recover v%d err=%v, want ErrNoCheckpoint（取消后不得残留有效版本）", v, err)
+		}
+	}
+	t.Logf("判定依据: 两个等待者无释放并发取消 -> 均返回 context.Canceled，中止后无残留")
+
+	// A 提交释放全部容量后，新事务可一次性写满 8 字节，证明容量完整归还、
+	// 取消路径没有吞掉任何唤醒信号。
+	if err := wa.Commit(); err != nil {
+		t.Fatalf("commit A: %v", err)
+	}
+	commitShards(t, s, 4, []byte("87654321"))
+	data, _, err := s.Recover(4)
+	if err != nil || string(data[0]) != "87654321" {
+		t.Fatalf("recover v4: data=%q err=%v", data[0], err)
+	}
+}
+
 // 单笔超过总容量的写入永远无法满足，两种策略都必须立即拒绝。
 func TestStagingExceedsTotalCapacity(t *testing.T) {
 	for _, policy := range []StagingPolicy{StagingReject, StagingWait} {

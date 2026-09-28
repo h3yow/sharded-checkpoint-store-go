@@ -79,6 +79,22 @@
 - **`StagingReject`（默认）**：超限立即返回 `ErrResourceLimit`。
 - **`StagingWait`**：阻塞等待空位；其他事务 `Commit`/`Abort` 释放配额后被唤醒。
   等待中 `ctx` 取消会尽快退出并返回 `ctx.Err()`。
+  - **一次释放，广播放行多个等待者**：释放不是“只唤醒一个排队者”的单信号，
+    而是在持锁状态下关闭当前代的等待通道（广播）并换入新一代通道。所有等待者
+    同时醒来、持锁重查容量：**当前空位放得下的等待者全部继续推进**（依次在
+    锁内扣减配额，扣减本身仍串行，因此不会超发）；放不下的等待者转入新一代
+    通道继续等待。这样先占配额的事务一次释放出足够多个排队者所需的空间时，
+    所有放得下的事务都在同一次释放后放行，不会出现“明明有空位却只动一个、
+    其余必须再等一次释放”的批量写入卡死。
+  - **虚惊与饿死**：广播允许“虚惊”——醒来后发现容量已被其他等待者先拿走，
+    则回到等待；只要当前空位确实放得下，重查者必然立即获得配额，不存在
+    “已有空位却迟迟拿不到”的饿死，也不存在唤醒信号丢失（通道在同一把锁下
+    复制与关闭，无丢唤醒窗口）。
+  - **等待中取消**：取消由等待者自己 `select` 监听 `ctx.Done()`，不依赖任何
+    释放或额外唤醒，多个等待者可各自独立、尽快退出；取消既不占用也不释放
+    容量，也不会吞掉其他等待者的广播。取消后 `Abort` 删除未提交目录，
+    存储中不残留任何会被恢复当作有效版本的内容（`Recover` 返回
+    `ErrNoCheckpoint`/`ErrIncompleteCommit`）。
 
 覆盖同序号分片按差额增减配额；单笔超过总容量的写入永远无法满足，两种策略都
 立即拒绝。无论拒绝还是取消，暂存数据尚未落盘，`Abort`/失败路径会清理目录并
@@ -108,8 +124,15 @@ go test -v ./...     # 查看关键输入与判定依据日志
 
 # 单独复现新增行为
 go test -v -run 'TestDerive' ./...        # 版本承接：与全量重写一致 / 来源失败无残留 / 老格式来源
-go test -v -run 'TestStaging' ./...       # 暂存超限：拒绝 / 等待取消 / 唤醒
+go test -v -run 'TestStaging' ./...       # 暂存超限：拒绝 / 等待取消 / 多等待者广播
 go test -v -run 'TestLowVersion|TestConcurrentOutOfOrder|TestVersionZero' ./...  # 版本准入竞争
+
+# 暂存等待策略的本地稳定复现（无 sleep 竞态，轮询内部等待者计数确认排队状态）
+go test -v -race -run 'TestStagingBudget' ./...   # 预算原语：一次放行多个 / 单个 /
+                                                  # 等待中取消 / 放不下继续等待不超发不饿死
+go test -v -race -run 'TestStagingWaitPolicyBroadcastMultiple' ./...         # 故障复现：一次释放多个排队事务同时推进
+go test -v -race -run 'TestStagingWaitPolicyCancelMultipleWaiters' ./...      # 多等待者并发取消无残留
+go test -race -count=20 -run 'TestStaging' ./...  # 高重复次数压测唤醒与取消时序
 ```
 
 测试覆盖：中断写入（`TestInterruptedWriteNotVisible`）、中止清理
@@ -121,6 +144,10 @@ go test -v -run 'TestLowVersion|TestConcurrentOutOfOrder|TestVersionZero' ./... 
 版本承接（`TestDeriveMatchesFullRewrite`/`TestDeriveFromUnavailableBase`/
 `TestDeriveFromLegacyFormat`/`TestDeriveAbort`）、
 暂存容量（`TestStagingRejectPolicy`/`TestStagingWaitPolicyCancel`/
-`TestStagingWaitPolicyUnblocked`/`TestStagingExceedsTotalCapacity`）、
+`TestStagingWaitPolicyUnblocked`/`TestStagingWaitPolicyBroadcastMultiple`/
+`TestStagingWaitPolicyCancelMultipleWaiters`/`TestStagingExceedsTotalCapacity`，
+以及预算原语级 `TestStagingBudgetBroadcastWakesMultipleWaiters`/
+`TestStagingBudgetSingleWaiterProceeds`/`TestStagingBudgetWaiterCancellation`/
+`TestStagingBudgetTooLargeWaiterKeepsWaiting`）、
 版本准入竞争（`TestLowVersionCommitRejectedAfterHighCommits`/
 `TestConcurrentOutOfOrderCommits`/`TestVersionZeroRejected`）。
